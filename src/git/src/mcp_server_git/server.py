@@ -1,3 +1,4 @@
+import json
 import logging
 from pathlib import Path
 from typing import Sequence, Optional
@@ -20,21 +21,49 @@ from pydantic import BaseModel, Field
 # Default number of context lines to show in diff output
 DEFAULT_CONTEXT_LINES = 3
 
+# Maximum bytes per diff chunk (~5k tokens ≈ 18KB at ~3.6 chars/token)
+DEFAULT_MAX_DIFF_BYTES = 18000
+
+
 class GitStatus(BaseModel):
     repo_path: str
 
 class GitDiffUnstaged(BaseModel):
     repo_path: str
     context_lines: int = DEFAULT_CONTEXT_LINES
+    auto_chunk: bool = Field(
+        True,
+        description="Enable automatic chunking of large diff output to fit within token limits",
+    )
+    continuation_token: Optional[str] = Field(
+        None,
+        description="Token from a previous chunked response to fetch the next chunk. Omit for first chunk.",
+    )
 
 class GitDiffStaged(BaseModel):
     repo_path: str
     context_lines: int = DEFAULT_CONTEXT_LINES
+    auto_chunk: bool = Field(
+        True,
+        description="Enable automatic chunking of large diff output to fit within token limits",
+    )
+    continuation_token: Optional[str] = Field(
+        None,
+        description="Token from a previous chunked response to fetch the next chunk. Omit for first chunk.",
+    )
 
 class GitDiff(BaseModel):
     repo_path: str
     target: str
     context_lines: int = DEFAULT_CONTEXT_LINES
+    auto_chunk: bool = Field(
+        True,
+        description="Enable automatic chunking of large diff output to fit within token limits",
+    )
+    continuation_token: Optional[str] = Field(
+        None,
+        description="Token from a previous chunked response to fetch the next chunk. Omit for first chunk.",
+    )
 
 class GitCommit(BaseModel):
     repo_path: str
@@ -71,6 +100,14 @@ class GitCheckout(BaseModel):
 class GitShow(BaseModel):
     repo_path: str
     revision: str
+    auto_chunk: bool = Field(
+        True,
+        description="Enable automatic chunking of large diff output to fit within token limits",
+    )
+    continuation_token: Optional[str] = Field(
+        None,
+        description="Token from a previous chunked response to fetch the next chunk. Omit for first chunk.",
+    )
 
 
 
@@ -107,6 +144,91 @@ class GitTools(str, Enum):
     SHOW = "git_show"
 
     BRANCH = "git_branch"
+
+
+def chunk_output(
+    text: str,
+    max_bytes: int = DEFAULT_MAX_DIFF_BYTES,
+    continuation_token: Optional[str] = None,
+) -> tuple[str, str]:
+    """Chunk output to fit within token limits.
+
+    Splits at line boundaries to avoid breaking mid-line.
+    Returns (chunk_text, chunk_metadata_json).
+
+    If the output fits within max_bytes, returns it as-is with empty metadata.
+    Otherwise, returns the current chunk with metadata containing:
+      - current_chunk: 1-based chunk number
+      - total_chunks: estimated total chunks
+      - has_more: whether there are more chunks
+      - continuation_token: token to fetch next chunk (byte offset)
+      - size_info: current_size and max_size in bytes
+    """
+    total_bytes = len(text.encode("utf-8"))
+
+    if total_bytes <= max_bytes and continuation_token is None:
+        return text, ""
+
+    # Decode continuation_token as byte offset
+    start_offset = 0
+    if continuation_token is not None:
+        try:
+            start_offset = int(continuation_token)
+        except ValueError:
+            start_offset = 0
+
+    if start_offset >= total_bytes:
+        return "", json.dumps({
+            "chunking": {
+                "current_chunk": 0,
+                "total_chunks": 0,
+                "has_more": False,
+                "continuation_token": None,
+                "size_info": {
+                    "current_size": 0,
+                    "max_size": max_bytes,
+                    "total_size": total_bytes,
+                },
+            }
+        })
+
+    # Find the end position for this chunk, splitting at line boundary
+    # Work with the string but track byte positions
+    text_from_offset = text[start_offset:] if start_offset > 0 else text
+    chunk_bytes = 0
+    chunk_end = 0
+
+    for line in text_from_offset.splitlines(keepends=True):
+        line_byte_len = len(line.encode("utf-8"))
+        if chunk_bytes + line_byte_len > max_bytes and chunk_bytes > 0:
+            break
+        chunk_bytes += line_byte_len
+        chunk_end += len(line)
+
+    chunk_text = text_from_offset[:chunk_end]
+    next_offset = start_offset + chunk_bytes
+    has_more = next_offset < total_bytes
+
+    current_chunk = (start_offset // max_bytes) + 1
+    total_chunks = (total_bytes + max_bytes - 1) // max_bytes
+
+    metadata = json.dumps({
+        "chunking": {
+            "current_chunk": current_chunk,
+            "total_chunks": total_chunks,
+            "has_more": has_more,
+            "continuation_token": str(next_offset) if has_more else None,
+            "size_info": {
+                "current_size": chunk_bytes,
+                "max_size": max_bytes,
+                "total_size": total_bytes,
+                "usage_percentage": round(chunk_bytes / max_bytes * 100, 1),
+            },
+        }
+    })
+
+    return chunk_text, metadata
+
 
 def git_status(repo: git.Repo) -> str:
     return repo.git.status()
@@ -489,24 +611,39 @@ async def serve(repository: Path | None) -> None:
 
             case GitTools.DIFF_UNSTAGED:
                 diff = git_diff_unstaged(repo, arguments.get("context_lines", DEFAULT_CONTEXT_LINES))
-                return [TextContent(
-                    type="text",
-                    text=f"Unstaged changes:\n{diff}"
-                )]
+                auto_chunk = arguments.get("auto_chunk", True)
+                continuation_token = arguments.get("continuation_token")
+                if auto_chunk:
+                    chunk_text, metadata = chunk_output(diff, continuation_token=continuation_token)
+                    result = f"Unstaged changes:\n{chunk_text}"
+                    if metadata:
+                        result += f"\n\n{metadata}"
+                    return [TextContent(type="text", text=result)]
+                return [TextContent(type="text", text=f"Unstaged changes:\n{diff}")]
 
             case GitTools.DIFF_STAGED:
                 diff = git_diff_staged(repo, arguments.get("context_lines", DEFAULT_CONTEXT_LINES))
-                return [TextContent(
-                    type="text",
-                    text=f"Staged changes:\n{diff}"
-                )]
+                auto_chunk = arguments.get("auto_chunk", True)
+                continuation_token = arguments.get("continuation_token")
+                if auto_chunk:
+                    chunk_text, metadata = chunk_output(diff, continuation_token=continuation_token)
+                    result = f"Staged changes:\n{chunk_text}"
+                    if metadata:
+                        result += f"\n\n{metadata}"
+                    return [TextContent(type="text", text=result)]
+                return [TextContent(type="text", text=f"Staged changes:\n{diff}")]
 
             case GitTools.DIFF:
                 diff = git_diff(repo, arguments["target"], arguments.get("context_lines", DEFAULT_CONTEXT_LINES))
-                return [TextContent(
-                    type="text",
-                    text=f"Diff with {arguments['target']}:\n{diff}"
-                )]
+                auto_chunk = arguments.get("auto_chunk", True)
+                continuation_token = arguments.get("continuation_token")
+                if auto_chunk:
+                    chunk_text, metadata = chunk_output(diff, continuation_token=continuation_token)
+                    result = f"Diff with {arguments['target']}:\n{chunk_text}"
+                    if metadata:
+                        result += f"\n\n{metadata}"
+                    return [TextContent(type="text", text=result)]
+                return [TextContent(type="text", text=f"Diff with {arguments['target']}:\n{diff}")]
 
             case GitTools.COMMIT:
                 result = git_commit(repo, arguments["message"])
@@ -562,10 +699,15 @@ async def serve(repository: Path | None) -> None:
 
             case GitTools.SHOW:
                 result = git_show(repo, arguments["revision"])
-                return [TextContent(
-                    type="text",
-                    text=result
-                )]
+                auto_chunk = arguments.get("auto_chunk", True)
+                continuation_token = arguments.get("continuation_token")
+                if auto_chunk:
+                    chunk_text, metadata = chunk_output(result, continuation_token=continuation_token)
+                    output = chunk_text
+                    if metadata:
+                        output += f"\n\n{metadata}"
+                    return [TextContent(type="text", text=output)]
+                return [TextContent(type="text", text=result)]
 
             case GitTools.BRANCH:
                 result = git_branch(
