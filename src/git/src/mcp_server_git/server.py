@@ -31,6 +31,18 @@ class GitStatus(BaseModel):
 class GitDiffUnstaged(BaseModel):
     repo_path: str
     context_lines: int = DEFAULT_CONTEXT_LINES
+    paths: Optional[list[str]] = Field(
+        None,
+        description="Optional list of file paths to filter the diff to. When omitted, shows diff for all changed files.",
+    )
+    stat: bool = Field(
+        True,
+        description="Include diff statistics (--stat) showing file names with insertion/deletion counts. Set false for diff-only output.",
+    )
+    diff: bool = Field(
+        True,
+        description="Include diff body (patch). Set false for stat-only output.",
+    )
     auto_chunk: bool = Field(
         True,
         description="Enable automatic chunking of large diff output to fit within token limits",
@@ -43,6 +55,18 @@ class GitDiffUnstaged(BaseModel):
 class GitDiffStaged(BaseModel):
     repo_path: str
     context_lines: int = DEFAULT_CONTEXT_LINES
+    paths: Optional[list[str]] = Field(
+        None,
+        description="Optional list of file paths to filter the diff to. When omitted, shows diff for all changed files.",
+    )
+    stat: bool = Field(
+        True,
+        description="Include diff statistics (--stat) showing file names with insertion/deletion counts. Set false for diff-only output.",
+    )
+    diff: bool = Field(
+        True,
+        description="Include diff body (patch). Set false for stat-only output.",
+    )
     auto_chunk: bool = Field(
         True,
         description="Enable automatic chunking of large diff output to fit within token limits",
@@ -56,6 +80,18 @@ class GitDiff(BaseModel):
     repo_path: str
     target: str
     context_lines: int = DEFAULT_CONTEXT_LINES
+    paths: Optional[list[str]] = Field(
+        None,
+        description="Optional list of file paths to filter the diff to. When omitted, shows diff for all changed files.",
+    )
+    stat: bool = Field(
+        True,
+        description="Include diff statistics (--stat) showing file names with insertion/deletion counts. Set false for diff-only output.",
+    )
+    diff: bool = Field(
+        True,
+        description="Include diff body (patch). Set false for stat-only output.",
+    )
     auto_chunk: bool = Field(
         True,
         description="Enable automatic chunking of large diff output to fit within token limits",
@@ -233,19 +269,45 @@ def chunk_output(
 def git_status(repo: git.Repo) -> str:
     return repo.git.status()
 
-def git_diff_unstaged(repo: git.Repo, context_lines: int = DEFAULT_CONTEXT_LINES) -> str:
-    return repo.git.diff(f"--unified={context_lines}")
+def git_diff_unstaged(repo: git.Repo, context_lines: int = DEFAULT_CONTEXT_LINES, paths: Optional[list[str]] = None, stat: bool = True, diff: bool = True) -> str:
+    args = []
+    if diff:
+        args.append(f"--unified={context_lines}")
+    if stat:
+        args.append("--stat")
+    if paths:
+        args.append("--")
+        args.extend(paths)
+    return repo.git.diff(*args)
 
-def git_diff_staged(repo: git.Repo, context_lines: int = DEFAULT_CONTEXT_LINES) -> str:
-    return repo.git.diff(f"--unified={context_lines}", "--cached")
+def git_diff_staged(repo: git.Repo, context_lines: int = DEFAULT_CONTEXT_LINES, paths: Optional[list[str]] = None, stat: bool = True, diff: bool = True) -> str:
+    args = []
+    if diff:
+        args.append(f"--unified={context_lines}")
+    args.append("--cached")
+    if stat:
+        args.append("--stat")
+    if paths:
+        args.append("--")
+        args.extend(paths)
+    return repo.git.diff(*args)
 
-def git_diff(repo: git.Repo, target: str, context_lines: int = DEFAULT_CONTEXT_LINES) -> str:
+def git_diff(repo: git.Repo, target: str, context_lines: int = DEFAULT_CONTEXT_LINES, paths: Optional[list[str]] = None, stat: bool = True, diff: bool = True) -> str:
     # Defense in depth: reject targets starting with '-' to prevent flag injection,
     # even if a malicious ref with that name exists (e.g. via filesystem manipulation)
     if target.startswith("-"):
         raise BadName(f"Invalid target: '{target}' - cannot start with '-'")
     repo.rev_parse(target)  # Validates target is a real git ref, throws BadName if not
-    return repo.git.diff(f"--unified={context_lines}", target)
+    args = []
+    if diff:
+        args.append(f"--unified={context_lines}")
+    args.append(target)
+    if stat:
+        args.append("--stat")
+    if paths:
+        args.append("--")
+        args.extend(paths)
+    return repo.git.diff(*args)
 
 def git_commit(repo: git.Repo, message: str) -> str:
     commit = repo.index.commit(message)
@@ -610,7 +672,13 @@ async def serve(repository: Path | None) -> None:
                 )]
 
             case GitTools.DIFF_UNSTAGED:
-                diff = git_diff_unstaged(repo, arguments.get("context_lines", DEFAULT_CONTEXT_LINES))
+                diff = git_diff_unstaged(
+                    repo,
+                    arguments.get("context_lines", DEFAULT_CONTEXT_LINES),
+                    arguments.get("paths"),
+                    arguments.get("stat", True),
+                    arguments.get("diff", True),
+                )
                 auto_chunk = arguments.get("auto_chunk", True)
                 continuation_token = arguments.get("continuation_token")
                 if auto_chunk:
@@ -622,7 +690,13 @@ async def serve(repository: Path | None) -> None:
                 return [TextContent(type="text", text=f"Unstaged changes:\n{diff}")]
 
             case GitTools.DIFF_STAGED:
-                diff = git_diff_staged(repo, arguments.get("context_lines", DEFAULT_CONTEXT_LINES))
+                diff = git_diff_staged(
+                    repo,
+                    arguments.get("context_lines", DEFAULT_CONTEXT_LINES),
+                    arguments.get("paths"),
+                    arguments.get("stat", True),
+                    arguments.get("diff", True),
+                )
                 auto_chunk = arguments.get("auto_chunk", True)
                 continuation_token = arguments.get("continuation_token")
                 if auto_chunk:
@@ -634,7 +708,14 @@ async def serve(repository: Path | None) -> None:
                 return [TextContent(type="text", text=f"Staged changes:\n{diff}")]
 
             case GitTools.DIFF:
-                diff = git_diff(repo, arguments["target"], arguments.get("context_lines", DEFAULT_CONTEXT_LINES))
+                diff = git_diff(
+                    repo,
+                    arguments["target"],
+                    arguments.get("context_lines", DEFAULT_CONTEXT_LINES),
+                    arguments.get("paths"),
+                    arguments.get("stat", True),
+                    arguments.get("diff", True),
+                )
                 auto_chunk = arguments.get("auto_chunk", True)
                 continuation_token = arguments.get("continuation_token")
                 if auto_chunk:
